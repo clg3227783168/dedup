@@ -1,0 +1,1 @@
+目标: 根据竞赛题目和评分指标要求完成一个自定义 snapshotter作为containerd 插件
