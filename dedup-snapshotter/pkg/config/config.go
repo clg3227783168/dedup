@@ -13,7 +13,6 @@ type Config struct {
 	Root          string        `json:"root"`
 	EnableErofs   bool          `json:"enable_erofs"`
 	EnableFscache bool          `json:"enable_fscache"`
-	EnableLazy    bool          `json:"enable_lazy"`
 	EnableMemDedup bool         `json:"enable_mem_dedup"`
 	Registry      string        `json:"registry"`
 	ChunkSize     int64         `json:"chunk_size"`
@@ -49,7 +48,6 @@ func DefaultConfig(root string) *Config {
 		Root:          root,
 		EnableErofs:   true,
 		EnableFscache: true,
-		EnableLazy:    true,
 		EnableMemDedup: true,
 		Registry:      "",
 		ChunkSize:     4 * 1024 * 1024,

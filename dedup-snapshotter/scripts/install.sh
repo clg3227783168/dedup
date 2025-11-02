@@ -88,12 +88,11 @@ EOF
         echo "Then restart containerd: systemctl restart containerd"
     fi
 fi
+systemctl start dedup-snapshotter
 
 echo ""
 echo "Installation complete!"
 echo "To start the snapshotter:"
-echo "  systemctl start dedup-snapshotter"
-echo "  systemctl enable dedup-snapshotter"
 echo ""
 echo "To check status:"
 echo "  systemctl status dedup-snapshotter"

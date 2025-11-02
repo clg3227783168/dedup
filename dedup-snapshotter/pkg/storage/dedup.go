@@ -16,7 +16,6 @@ import (
 	"github.com/containerd/log"
 	"github.com/opencloudos/dedup-snapshotter/pkg/erofs"
 	"github.com/opencloudos/dedup-snapshotter/pkg/fscache"
-	"github.com/opencloudos/dedup-snapshotter/pkg/lazy"
 	"github.com/opencloudos/dedup-snapshotter/pkg/memory"
 )
 
@@ -25,19 +24,19 @@ const (
 )
 
 type DedupStore struct {
-	root         string
-	chunksDir    string
-	snapsDir     string
-	imagesDir    string
-	indexDB      *IndexDB
-	chunkCache   sync.Map
-	erofsBuilder *erofs.Builder
-	mountManager *erofs.MountManager
-	lazyLoader   *lazy.LazyLoader
-	memDedup     *memory.MemoryDeduplicator
-	dedupDaemon  *fscache.DedupDaemon
-	useErofs     bool
-	useFscache   bool
+	root          string
+	chunksDir     string
+	snapsDir      string
+	imagesDir     string
+	indexDB       *IndexDB
+	chunkCache    sync.Map
+	erofsBuilder  *erofs.Builder
+	mountManager  *erofs.MountManager
+	memDedup      *memory.MemoryDeduplicator
+	dedupDaemon   *fscache.DedupDaemon
+	layerProcessor *LayerProcessor
+	useErofs      bool
+	useFscache    bool
 }
 
 type ChunkInfo struct {
@@ -84,6 +83,9 @@ func NewDedupStoreWithOptions(root string, useErofs bool, useFscache bool) (*Ded
 		useFscache: useFscache,
 	}
 
+	// 初始化层处理器
+	store.layerProcessor = NewLayerProcessor(store)
+
 	if useErofs {
 		builder, err := erofs.NewBuilder(root)
 		if err != nil {
@@ -105,12 +107,6 @@ func NewDedupStoreWithOptions(root string, useErofs bool, useFscache bool) (*Ded
 				store.dedupDaemon = dedupDaemon
 				log.L.Info("dedupd daemon initialized for fscache support")
 			}
-		} else {
-			lazyLoader, err := lazy.NewLazyLoader(root, "")
-			if err != nil {
-				return nil, fmt.Errorf("failed to create lazy loader: %w", err)
-			}
-			store.lazyLoader = lazyLoader
 		}
 
 		memDedup, err := memory.NewMemoryDeduplicator(root)
@@ -170,10 +166,10 @@ func (d *DedupStore) Prepare(ctx context.Context, id string, parents []string) e
 }
 
 func (d *DedupStore) Mounts(id string, parents []string) ([]mount.Mount, error) {
-	if d.useErofs && d.mountManager != nil {
-		return d.mountsWithErofs(id, parents)
+	if !d.useErofs || d.mountManager == nil {
+		return nil, fmt.Errorf("erofs is required: useErofs=%v, mountManager=%v", d.useErofs, d.mountManager != nil)
 	}
-	return d.mountsWithOverlay(id, parents)
+	return d.mountsWithErofs(id, parents)
 }
 
 func (d *DedupStore) mountsWithErofs(id string, parents []string) ([]mount.Mount, error) {
@@ -181,40 +177,39 @@ func (d *DedupStore) mountsWithErofs(id string, parents []string) ([]mount.Mount
 
 	for _, parent := range parents {
 		imagePath := filepath.Join(d.imagesDir, parent+erofs.ErofsImageExt)
-		if _, err := os.Stat(imagePath); err == nil {
-			var mountPath string
-			var err error
+		if _, err := os.Stat(imagePath); err != nil {
+			return nil, fmt.Errorf("erofs image not found for parent %s: %w", parent, err)
+		}
 
-			if d.useFscache && d.dedupDaemon != nil {
-				fsid := parent
-				domain := "dedup-snapshotter"
-				mountPath, err = d.mountManager.MountErofsWithFscache(parent, fsid, domain)
-				if err != nil {
-					log.L.Warnf("fscache mount failed, falling back to loop mount: %v", err)
-					mountPath, err = d.mountManager.MountErofs(parent, imagePath)
-				}
-			} else {
+		var mountPath string
+		var err error
+
+		if d.useFscache && d.dedupDaemon != nil {
+			fsid := parent
+			domain := "dedup-snapshotter"
+			mountPath, err = d.mountManager.MountErofsWithFscache(parent, fsid, domain)
+			if err != nil {
+				log.L.Warnf("fscache mount failed, falling back to loop mount: %v", err)
 				mountPath, err = d.mountManager.MountErofs(parent, imagePath)
 			}
-
-			if err != nil {
-				return nil, fmt.Errorf("failed to mount erofs image %s: %w", parent, err)
-			}
-			lowerDirs = append(lowerDirs, mountPath)
-
-			if d.memDedup != nil {
-				go func(path string) {
-					filepath.Walk(path, func(p string, info os.FileInfo, err error) error {
-						if err == nil && info.Mode().IsRegular() && info.Size() > 0 {
-							d.memDedup.DeduplicateFile(p)
-						}
-						return nil
-					})
-				}(mountPath)
-			}
 		} else {
-			parentPath := filepath.Join(d.snapsDir, parent, "fs")
-			lowerDirs = append(lowerDirs, parentPath)
+			mountPath, err = d.mountManager.MountErofs(parent, imagePath)
+		}
+
+		if err != nil {
+			return nil, fmt.Errorf("failed to mount erofs image %s: %w", parent, err)
+		}
+		lowerDirs = append(lowerDirs, mountPath)
+
+		if d.memDedup != nil {
+			go func(path string) {
+				filepath.Walk(path, func(p string, info os.FileInfo, err error) error {
+					if err == nil && info.Mode().IsRegular() && info.Size() > 0 {
+						d.memDedup.DeduplicateFile(p)
+					}
+					return nil
+				})
+			}(mountPath)
 		}
 	}
 
@@ -223,50 +218,6 @@ func (d *DedupStore) mountsWithErofs(id string, parents []string) ([]mount.Mount
 	upperDir := filepath.Join(snapPath, "fs")
 
 	return d.mountManager.CreateOverlayMounts(id, lowerDirs, upperDir, workDir)
-}
-
-func (d *DedupStore) mountsWithOverlay(id string, parents []string) ([]mount.Mount, error) {
-	snapPath := filepath.Join(d.snapsDir, id)
-	workDir := filepath.Join(snapPath, "work")
-	upperDir := filepath.Join(snapPath, "fs")
-
-	if err := os.MkdirAll(workDir, 0700); err != nil {
-		return nil, err
-	}
-	if err := os.MkdirAll(upperDir, 0755); err != nil {
-		return nil, err
-	}
-
-	var lowerDirs []string
-	for _, parent := range parents {
-		parentPath := filepath.Join(d.snapsDir, parent, "fs")
-		lowerDirs = append(lowerDirs, parentPath)
-	}
-
-	options := []string{
-		fmt.Sprintf("workdir=%s", workDir),
-		fmt.Sprintf("upperdir=%s", upperDir),
-	}
-
-	if len(lowerDirs) > 0 {
-		lowerDir := ""
-		for i := len(lowerDirs) - 1; i >= 0; i-- {
-			if lowerDir == "" {
-				lowerDir = lowerDirs[i]
-			} else {
-				lowerDir = lowerDirs[i] + ":" + lowerDir
-			}
-		}
-		options = append(options, fmt.Sprintf("lowerdir=%s", lowerDir))
-	}
-
-	return []mount.Mount{
-		{
-			Type:    "overlay",
-			Source:  "overlay",
-			Options: options,
-		},
-	}, nil
 }
 
 func (d *DedupStore) Remove(ctx context.Context, id string) error {
@@ -305,12 +256,6 @@ func (d *DedupStore) Close() error {
 
 	if d.mountManager != nil {
 		if err := d.mountManager.UnmountAll(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-
-	if d.lazyLoader != nil {
-		if err := d.lazyLoader.Cleanup(); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -519,4 +464,42 @@ func (d *DedupStore) VerifyChunks(ctx context.Context) error {
 
 	log.L.Infof("chunk verification: %d verified, %d missing or invalid", verifiedCount, missingCount)
 	return nil
+}
+
+// ApplyLayer 应用一个 OCI 层到快照系统
+// 这个方法会被 containerd 在镜像拉取时调用
+func (d *DedupStore) ApplyLayer(ctx context.Context, layerID string, layerData io.Reader, parentID string) error {
+	if d.layerProcessor == nil {
+		return fmt.Errorf("layer processor not initialized")
+	}
+
+	return d.layerProcessor.ProcessLayer(ctx, layerID, layerData, parentID)
+}
+
+// GetLayerMetadata 获取层元数据
+func (d *DedupStore) GetLayerMetadata(layerID string) (*LayerMetadata, error) {
+	metadataPath := filepath.Join(d.root, "metadata", layerID+".json")
+	data, err := os.ReadFile(metadataPath)
+	if err != nil {
+		return nil, err
+	}
+
+	var metadata LayerMetadata
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return nil, err
+	}
+
+	return &metadata, nil
+}
+
+// HasErofsImage 检查是否已经有 EROFS 镜像
+func (d *DedupStore) HasErofsImage(imageID string) bool {
+	imagePath := filepath.Join(d.imagesDir, imageID+".erofs")
+	_, err := os.Stat(imagePath)
+	return err == nil
+}
+
+// GetSnapshotPath 获取快照路径
+func (d *DedupStore) GetSnapshotPath(snapID string) string {
+	return filepath.Join(d.snapsDir, snapID)
 }

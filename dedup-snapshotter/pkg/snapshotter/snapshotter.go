@@ -2,9 +2,10 @@ package snapshotter
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
-	"time"
 
 	"github.com/containerd/containerd/mount"
 	"github.com/containerd/containerd/snapshots"
@@ -128,17 +129,17 @@ func (s *Snapshotter) Mounts(ctx context.Context, key string) ([]mount.Mount, er
 	return s.mounts(snap)
 }
 
-func (s *Snapshotter) Prepare(ctx context.Context, key, parent string, opts ...snapshots.Opt) ([]mount.Mount, error) {
-	startTime := time.Now()
+func (s *Snapshotter) Prepare(ctx context.Context, key, parent string, opts ...snapshots.Opt) (mounts []mount.Mount, err error) {
 	if s.auditLogger != nil {
 		ctx = audit.StartAudit(ctx, "prepare_snapshot", key, "containerd", os.Getpid(), map[string]interface{}{
 			"parent": parent,
 			"key":    key,
 		})
 		defer func() {
-			duration := time.Since(startTime)
 			result := "success"
-			var err error
+			if err != nil {
+				result = "failure"
+			}
 			audit.FinishAudit(ctx, s.auditLogger, result, err)
 		}()
 	}
@@ -149,19 +150,19 @@ func (s *Snapshotter) View(ctx context.Context, key, parent string, opts ...snap
 	return s.createSnapshot(ctx, snapshots.KindView, key, parent, opts...)
 }
 
-func (s *Snapshotter) Commit(ctx context.Context, name, key string, opts ...snapshots.Opt) error {
+func (s *Snapshotter) Commit(ctx context.Context, name, key string, opts ...snapshots.Opt) (err error) {
 	if s.auditLogger != nil {
 		ctx = audit.StartAudit(ctx, "commit_snapshot", key, "containerd", os.Getpid(), map[string]interface{}{
 			"name": name,
 			"key":  key,
 		})
-		defer func(err *error) {
+		defer func() {
 			result := "success"
-			if *err != nil {
+			if err != nil {
 				result = "failure"
 			}
-			audit.FinishAudit(ctx, s.auditLogger, result, *err)
-		}(&err)
+			audit.FinishAudit(ctx, s.auditLogger, result, err)
+		}()
 	}
 
 	ctx, t, err := s.ms.TransactionContext(ctx, true)
@@ -191,18 +192,18 @@ func (s *Snapshotter) Commit(ctx context.Context, name, key string, opts ...snap
 	return t.Commit()
 }
 
-func (s *Snapshotter) Remove(ctx context.Context, key string) error {
+func (s *Snapshotter) Remove(ctx context.Context, key string) (err error) {
 	if s.auditLogger != nil {
 		ctx = audit.StartAudit(ctx, "remove_snapshot", key, "containerd", os.Getpid(), map[string]interface{}{
 			"key": key,
 		})
-		defer func(err *error) {
+		defer func() {
 			result := "success"
-			if *err != nil {
+			if err != nil {
 				result = "failure"
 			}
-			audit.FinishAudit(ctx, s.auditLogger, result, *err)
-		}(&err)
+			audit.FinishAudit(ctx, s.auditLogger, result, err)
+		}()
 	}
 
 	s.activeMountsMu.Lock()
@@ -266,8 +267,16 @@ func (s *Snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		return nil, err
 	}
 
+	// 准备快照存储
 	if err := s.storage.Prepare(ctx, snap.ID, snap.ParentIDs); err != nil {
 		return nil, err
+	}
+
+	// 检查并自动转换层(如果需要)
+	// 当 containerd 拉取镜像时,会为每一层调用 Prepare
+	// 我们在这里检测是否是新层,如果是则自动转换为 EROFS
+	if err := s.autoConvertLayer(ctx, snap.ID, snap.ParentIDs); err != nil {
+		log.L.WithError(err).Warnf("auto-convert layer %s failed, will use fallback", snap.ID)
 	}
 
 	if err := t.Commit(); err != nil {
@@ -275,6 +284,78 @@ func (s *Snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 	}
 
 	return s.mounts(snap)
+}
+
+// autoConvertLayer 自动检测并转换新层为 EROFS 格式
+func (s *Snapshotter) autoConvertLayer(ctx context.Context, snapID string, parentIDs []string) error {
+	// 检查是否已经有 EROFS 镜像
+	if s.storage.HasErofsImage(snapID) {
+		log.L.Debugf("layer %s already has erofs image, skip conversion", snapID)
+		return nil
+	}
+
+	// 检查快照目录是否有内容(说明是新拉取的层)
+	snapPath := s.storage.GetSnapshotPath(snapID)
+	fsPath := filepath.Join(snapPath, "fs")
+
+	isEmpty, err := isDirEmpty(fsPath)
+	if err != nil || isEmpty {
+		// 目录不存在或为空,跳过转换
+		return nil
+	}
+
+	// 有内容,说明是新层,自动转换为 EROFS
+	log.L.Infof("detected new layer %s, auto-converting to EROFS", snapID)
+
+	if err := s.storage.BuildErofsImage(ctx, fsPath, snapID); err != nil {
+		return fmt.Errorf("failed to build erofs for layer %s: %w", snapID, err)
+	}
+
+	// 注册到 fscache
+	if err := s.registerLayerToFscache(ctx, snapID, fsPath); err != nil {
+		log.L.WithError(err).Warnf("failed to register layer %s to fscache", snapID)
+	}
+
+	log.L.Infof("successfully auto-converted layer %s to EROFS", snapID)
+	return nil
+}
+
+// registerLayerToFscache 注册层到 fscache
+func (s *Snapshotter) registerLayerToFscache(ctx context.Context, layerID string, sourceDir string) error {
+	manifestPath := filepath.Join(s.root, "manifests", layerID+".manifest")
+	if err := os.MkdirAll(filepath.Dir(manifestPath), 0755); err != nil {
+		return err
+	}
+
+	// 生成简单的文件清单
+	file, err := os.Create(manifestPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	// 遍历生成清单
+	filepath.Walk(sourceDir, func(path string, info os.FileInfo, err error) error {
+		if err == nil && info.Mode().IsRegular() {
+			relPath, _ := filepath.Rel(sourceDir, path)
+			fmt.Fprintf(file, "%s\t%d\n", relPath, info.Size())
+		}
+		return nil
+	})
+
+	return s.storage.RegisterImageForFscache(ctx, layerID, manifestPath)
+}
+
+// isDirEmpty 检查目录是否为空
+func isDirEmpty(path string) (bool, error) {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	return len(entries) == 0, nil
 }
 
 func (s *Snapshotter) mounts(snap storage.Snapshot) ([]mount.Mount, error) {
